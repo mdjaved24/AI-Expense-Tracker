@@ -9,6 +9,8 @@ from fastapi import File, UploadFile
 import os
 import pandas as pd
 
+from fastapi.middleware.cors import CORSMiddleware
+
 models.Base.metadata.create_all(bind=engine)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +18,16 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(title="User Auth API")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # DB dependency
 def get_db():
@@ -130,4 +142,5 @@ def read_own_csv(
         "rows": len(df),
         "columns": list(df.columns),
         "data": df.to_dict(orient="records")
+
     }
