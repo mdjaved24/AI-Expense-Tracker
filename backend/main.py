@@ -10,6 +10,10 @@ import os
 import pandas as pd
 from datetime import datetime
 
+from typing import Optional
+from datetime import date
+from fastapi import Query
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -203,14 +207,42 @@ async def upload_transactions_csv(
         "count": len(transactions)
     }
 
-#✅ Get My Transactions
+
+
+#✅ Get Transactions with Filters
 @app.get("/my-transactions")
 def get_my_transactions(
+    type: Optional[str] = Query(None, regex="^(credit|debit)$"),
+    category: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    txs = db.query(models.Transaction).filter(
+    query = db.query(models.Transaction).filter(
         models.Transaction.user_id == current_user.id
-    ).all()
+    )
 
-    return txs
+    if type:
+        query = query.filter(models.Transaction.type == type)
+
+    if category:
+        query = query.filter(models.Transaction.category.ilike(f"%{category}%"))
+
+    if start_date:
+        query = query.filter(models.Transaction.transaction_date >= start_date)
+
+    if end_date:
+        query = query.filter(models.Transaction.transaction_date <= end_date)
+
+    if min_amount is not None:
+        query = query.filter(models.Transaction.amount >= min_amount)
+
+    if max_amount is not None:
+        query = query.filter(models.Transaction.amount <= max_amount)
+
+    results = query.order_by(models.Transaction.transaction_date.desc()).all()
+    return results
+
