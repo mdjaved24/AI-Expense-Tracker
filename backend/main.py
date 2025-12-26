@@ -8,8 +8,11 @@ from auth import hash_password, verify_password, create_access_token, get_curren
 from fastapi import File, UploadFile
 import os
 import pandas as pd
+from datetime import datetime
+
 
 from fastapi.middleware.cors import CORSMiddleware
+
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -18,7 +21,6 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(title="User Auth API")
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -142,5 +144,73 @@ def read_own_csv(
         "rows": len(df),
         "columns": list(df.columns),
         "data": df.to_dict(orient="records")
-
     }
+
+# ✅ Upload Transactions via CSV
+@app.post("/upload-transactions-csv")
+async def upload_transactions_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+
+    try:
+        df = pd.read_csv(file.file)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
+
+    required_cols = {"amount", "type", "category", "description", "transaction_date"}
+    if not required_cols.issubset(df.columns):
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV must contain columns: {required_cols}"
+        )
+
+    transactions = []
+    for idx, row in df.iterrows():
+        tx_type = str(row["type"]).lower()
+        if tx_type not in ("credit", "debit"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid type at row {idx + 2}. Must be credit/debit"
+            )
+
+        try:
+            tx_date = pd.to_datetime(row["transaction_date"]).date()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid date at row {idx + 2}. Use YYYY-MM-DD"
+            )
+
+        tx = models.Transaction(
+            user_id=current_user.id,
+            amount=float(row["amount"]),
+            type=tx_type,
+            category=str(row["category"]),
+            description=str(row.get("description", "")),
+            transaction_date=tx_date
+        )
+        transactions.append(tx)
+
+    db.add_all(transactions)
+    db.commit()
+
+    return {
+        "message": "Transactions imported successfully",
+        "count": len(transactions)
+    }
+
+#✅ Get My Transactions
+@app.get("/my-transactions")
+def get_my_transactions(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    txs = db.query(models.Transaction).filter(
+        models.Transaction.user_id == current_user.id
+    ).all()
+
+    return txs
