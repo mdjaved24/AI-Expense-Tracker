@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 from datetime import date
 from fastapi import Query
+from sqlalchemy import func
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,78 +79,6 @@ def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
     return {"access_token": token, "token_type": "bearer"}
 
 
-# ✅ Upload CSV
-@app.post("/upload-csv")
-async def upload_csv(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files allowed")
-
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-
-    new_file = models.UploadedFile(
-        filename=file.filename,
-        owner_id=current_user.id
-    )
-    db.add(new_file)
-    db.commit()
-    db.refresh(new_file)
-
-    return {
-        "message": "File uploaded successfully",
-        "filename": file.filename,
-        "uploaded_by": current_user.username
-    }
-
-@app.get("/read-csv/{id}")
-def read_own_csv(
-    id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    file_record = db.query(models.UploadedFile).filter(
-        models.UploadedFile.id == id,
-        models.UploadedFile.owner_id == current_user.id
-    ).first()
-
-    if not file_record:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    filename = file_record.filename
-    file_path = os.path.join(UPLOAD_DIR, filename)
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # Read CSV
-    df = pd.read_csv(file_path)
-    
-    # METHOD 1: Use fillna with explicit dtype conversion
-    df = df.fillna(0)  # Fill numeric NaN with 0
-    df = df.fillna("")  # Fill any remaining NaN with empty string
-    
-    # Convert all columns to Python native types
-    for col in df.columns:
-        if df[col].dtype == 'float64':
-            df[col] = df[col].astype(float)
-        elif df[col].dtype == 'int64':
-            df[col] = df[col].astype(int)
-    
-    return {
-        "file_id": id,
-        "filename": filename,
-        "rows": len(df),
-        "columns": list(df.columns),
-        "data": df.to_dict(orient="records")
-    }
-
 # ✅ Upload Transactions via CSV
 @app.post("/upload-transactions-csv")
 async def upload_transactions_csv(
@@ -160,8 +89,25 @@ async def upload_transactions_csv(
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
 
+    # 1️⃣ Save file to disk
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # 2️⃣ Save file record in DB
+    new_file = models.UploadedFile(
+        filename=file.filename,
+        owner_id=current_user.id
+    )
+    db.add(new_file)
+    db.commit()
+    db.refresh(new_file)
+
+    # 3️⃣ Read CSV from saved file
     try:
-        df = pd.read_csv(file.file)
+        df = pd.read_csv(file_path)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid CSV file")
 
@@ -172,6 +118,7 @@ async def upload_transactions_csv(
             detail=f"CSV must contain columns: {required_cols}"
         )
 
+    # 4️⃣ Parse and prepare transactions
     transactions = []
     for idx, row in df.iterrows():
         tx_type = str(row["type"]).lower()
@@ -199,14 +146,16 @@ async def upload_transactions_csv(
         )
         transactions.append(tx)
 
+    # 5️⃣ Save transactions
     db.add_all(transactions)
     db.commit()
 
     return {
-        "message": "Transactions imported successfully",
-        "count": len(transactions)
+        "message": "File uploaded and transactions imported successfully",
+        "filename": file.filename,
+        "file_id": new_file.id,
+        "transactions_imported": len(transactions)
     }
-
 
 
 #✅ Get Transactions with Filters
@@ -246,3 +195,55 @@ def get_my_transactions(
     results = query.order_by(models.Transaction.transaction_date.desc()).all()
     return results
 
+
+# ✅ Transactions Summary with Filters
+@app.get("/transactions-summary")
+def transactions_summary(
+    type: Optional[str] = Query(None, regex="^(credit|debit)$"),
+    category: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    query = db.query(models.Transaction).filter(
+        models.Transaction.user_id == current_user.id
+    )
+
+    # 🔎 Apply filters
+    if type:
+        query = query.filter(models.Transaction.type == type)
+
+    if category:
+        query = query.filter(models.Transaction.category.ilike(f"%{category}%"))
+
+    if start_date:
+        query = query.filter(models.Transaction.transaction_date >= start_date)
+
+    if end_date:
+        query = query.filter(models.Transaction.transaction_date <= end_date)
+
+    if min_amount is not None:
+        query = query.filter(models.Transaction.amount >= min_amount)
+
+    if max_amount is not None:
+        query = query.filter(models.Transaction.amount <= max_amount)
+
+    # 📊 Aggregations
+    total_credit = query.filter(models.Transaction.type == "credit") \
+                        .with_entities(func.coalesce(func.sum(models.Transaction.amount), 0)) \
+                        .scalar()
+
+    total_debit = query.filter(models.Transaction.type == "debit") \
+                       .with_entities(func.coalesce(func.sum(models.Transaction.amount), 0)) \
+                       .scalar()
+
+    count = query.with_entities(func.count(models.Transaction.id)).scalar()
+
+    return {
+        "total_credit": float(total_credit or 0),
+        "total_debit": float(total_debit or 0),
+        "balance": float((total_credit or 0) - (total_debit or 0)),
+    }
